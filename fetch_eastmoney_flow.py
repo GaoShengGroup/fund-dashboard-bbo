@@ -2,15 +2,12 @@
 """
 GitHub Actions 脚本：用 Playwright 抓取东方财富行业资金流向数据（全量翻页）
 生成 industry_fund_flow.js（兼容现有仪表盘格式）
-
-用法:
-  python fetch_eastmoney_flow.py -o ./output/industry_fund_flow.js
 """
 
 import asyncio
 import json
-import re
 import sys
+import traceback
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -36,7 +33,6 @@ EM_TO_THS = {
     "调味发酵品Ⅱ": "食品加工制造",
 }
 
-# API 配置：周期 → (fid, fields)
 PERIOD_CONFIG = {
     "今日": ("f62", "f12,f14,f3,f62,f184"),
     "3日": ("f267", "f12,f14,f127,f267,f268"),
@@ -44,9 +40,7 @@ PERIOD_CONFIG = {
     "10日": ("f174", "f12,f14,f160,f174,f175"),
 }
 
-
 def parse_value(raw):
-    """将 '29.81亿' / '1.5%' / '1.2' 转为 float"""
     if isinstance(raw, (int, float)):
         return float(raw)
     raw = str(raw).strip()
@@ -58,7 +52,6 @@ def parse_value(raw):
         return float(raw[:-1])
     return float(raw)
 
-
 async def fetch_page(page, fid, fields, pn):
     """在浏览器上下文中调用 push2 API，返回单页数据"""
     url = (
@@ -66,30 +59,39 @@ async def fetch_page(page, fid, fields, pn):
         f"?fid={fid}&po=1&pz=50&pn={pn}&np=1&fltt=2&invt=2"
         f"&fs=m:90+t2&fields={fields}"
     )
-    result = await page.evaluate(f"""
-        async () => {{
-            const resp = await fetch(`{url}`);
-            return await resp.json();
-        }}
-    """)
-    data = result.get("data")
+    js_code = f"""
+        (async () => {{
+            try {{
+                const resp = await fetch(`{url}`, {{ credentials: 'include' }});
+                if (!resp.ok) {{
+                    return {{ _error: 'HTTP ' + resp.status }};
+                }}
+                return await resp.json();
+            }} catch(e) {{
+                return {{ _error: e.message || String(e) }};
+            }}
+        }})()
+    """
+    result = await page.evaluate(js_code)
+    if isinstance(result, dict) and "_error" in result:
+        print(f"    JS fetch error: {result['_error']}")
+        return []
+    data = result.get("data") if result else None
     if not data or not data.get("diff"):
         return []
     return data["diff"]
 
-
 async def fetch_all_pages(page, fid, fields):
     """翻页抓取所有行业数据"""
     all_items = []
-    for pn in range(1, 10):  # 最多 10 页（128 行业 = 3 页）
+    for pn in range(1, 10):
         items = await fetch_page(page, fid, fields, pn)
         if not items:
             break
         all_items.extend(items)
         if len(items) < 50:
-            break  # 最后一页不足 50 条
+            break
     return all_items
-
 
 async def fetch_data():
     """主抓取逻辑"""
@@ -104,33 +106,32 @@ async def fetch_data():
         )
         page = await context.new_page()
 
-        # 访问页面获取 session cookie
-        print("  访问 data.eastmoney.com ...")
-        await page.goto("https://data.eastmoney.com/bkzj/hy.html",
-                        wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(3000)
+        # 访问页面获取 session
+        print("  访问 data.eastmoney.com ...", flush=True)
+        try:
+            resp = await page.goto("https://data.eastmoney.com/bkzj/hy.html",
+                                   wait_until="domcontentloaded", timeout=30000)
+            print(f"    HTTP {resp.status}", flush=True)
+        except Exception as e:
+            print(f"    goto 失败: {e}", flush=True)
+            raise
+        await page.wait_for_timeout(2000)
 
         all_data = {}
         for period, (fid, fields) in PERIOD_CONFIG.items():
             print(f"  抓取 {period} ...", end=" ", flush=True)
             items = await fetch_all_pages(page, fid, fields)
             all_data[period] = items
-            print(f"{len(items)} 条")
+            print(f"{len(items)} 条", flush=True)
 
         await browser.close()
     return all_data
 
-
 def convert_to_ths_format(em_data):
-    """将东财数据转为同花顺格式，处理多对一合并"""
+    """将东财数据转为同花顺格式"""
     periods = ["今日", "3日", "5日", "10日"]
-
-    net_field_map = {
-        "今日": "f62", "3日": "f267", "5日": "f164", "10日": "f174",
-    }
-    pct_field_map = {
-        "今日": "f3", "3日": "f127", "5日": "f109", "10日": "f160",
-    }
+    net_field_map = {"今日": "f62", "3日": "f267", "5日": "f164", "10日": "f174"}
+    pct_field_map = {"今日": "f3", "3日": "f127", "5日": "f109", "10日": "f160"}
 
     aggregated = {p: {} for p in periods}
 
@@ -140,13 +141,10 @@ def convert_to_ths_format(em_data):
             ths_name = EM_TO_THS.get(em_name)
             if not ths_name:
                 continue
-
             net_val = parse_value(item.get(net_field_map[period], 0))
             pct_val = parse_value(item.get(pct_field_map[period], 0))
-
             if ths_name not in aggregated[period]:
                 aggregated[period][ths_name] = {"net": 0.0, "tradezdf": 0.0, "count": 0}
-
             aggregated[period][ths_name]["net"] += net_val
             aggregated[period][ths_name]["tradezdf"] = max(
                 aggregated[period][ths_name]["tradezdf"], pct_val
@@ -156,47 +154,42 @@ def convert_to_ths_format(em_data):
     result = {}
     for period in periods:
         result[period] = [
-            {
-                "industry": name,
-                "net": round(data["net"], 2),
-                "tradezdf": round(data["tradezdf"], 2),
-                "flowIn": None,
-                "flowOut": None,
-            }
+            {"industry": name, "net": round(data["net"], 2),
+             "tradezdf": round(data["tradezdf"], 2), "flowIn": None, "flowOut": None}
             for name, data in aggregated[period].items()
         ]
 
-    # 20日：东财不支持，用10日替代
     result["20日"] = [dict(item) for item in result["10日"]]
-
     return result
-
 
 def main():
     import argparse
-
     parser = argparse.ArgumentParser(description="抓取东财行业资金流向（全量翻页）")
-    parser.add_argument("-o", "--output", default="./output/industry_fund_flow.js", help="输出文件路径")
-    parser.add_argument("--dry-run", action="store_true", help="仅测试，不写入文件")
+    parser.add_argument("-o", "--output", default="./output/industry_fund_flow.js")
+    parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    print("=" * 50)
-    print("东方财富行业资金流向抓取（全量翻页）")
-    print(f"时间: {datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S')}")
-    print("=" * 50)
+    print("=" * 50, flush=True)
+    print("东方财富行业资金流向抓取（全量翻页）", flush=True)
+    print(f"时间: {datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+    print("=" * 50, flush=True)
 
-    print("\n[1/3] 启动 Playwright 并翻页抓取 ...")
-    em_data = asyncio.run(fetch_data())
+    print("\n[1/3] 启动 Playwright 并翻页抓取 ...", flush=True)
+    try:
+        em_data = asyncio.run(fetch_data())
+    except Exception as e:
+        print(f"\n!!! 抓取失败: {e}", flush=True)
+        traceback.print_exc()
+        sys.exit(1)
 
     total = sum(len(v) for v in em_data.values())
-    print(f"\n抓取完成，共 {total} 条记录")
+    print(f"\n抓取完成，共 {total} 条记录", flush=True)
 
-    print("\n[2/3] 转换为同花顺格式 ...")
+    print("\n[2/3] 转换为同花顺格式 ...", flush=True)
     ths_data = convert_to_ths_format(em_data)
 
     today = datetime.now(timezone(timedelta(hours=8)))
     date_str = today.strftime("%Y-%m-%d")
-
     output_obj = {**ths_data, "DATE": date_str}
     js_content = (
         "// 行业资金流向数据 - auto-generated by GitHub Actions\n"
@@ -204,30 +197,23 @@ def main():
     )
 
     if args.dry_run:
-        print(f"\n[3/3] DRY RUN: 未写入文件")
-        print(f"数据大小: {len(js_content)} 字节")
-        print(f"行业数: {len(ths_data.get('今日', []))}")
+        print(f"\n[3/3] DRY RUN: 未写入文件", flush=True)
     else:
         output_path = Path(args.output)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(js_content, encoding="utf-8")
-        print(f"\n[3/3] 已写入: {output_path}")
-        print(f"文件大小: {output_path.stat().st_size} 字节")
-        print(f"行业数: {len(ths_data.get('今日', []))}")
+        print(f"\n[3/3] 已写入: {output_path}", flush=True)
 
-    # 摘要
-    print("\n" + "=" * 50)
-    print("数据摘要:")
+    print("\n" + "=" * 50, flush=True)
+    print("数据摘要:", flush=True)
     for period in ["今日", "3日", "5日", "10日"]:
         items = sorted(ths_data.get(period, []), key=lambda x: x["net"], reverse=True)
         top3_in = items[:3]
         bottom3_out = sorted(items, key=lambda x: x["net"])[:3]
-        print(f"  {period}:")
-        print(f"    流入 Top3: " + "  ".join(f"{x['industry']}({x['net']:.2f}亿)" for x in top3_in))
-        print(f"    流出 Top3: " + "  ".join(f"{x['industry']}({x['net']:.2f}亿)" for x in bottom3_out))
-    print(f"  DATE: {date_str}")
-    print("=" * 50)
-
+        print(f"  {period}:", flush=True)
+        print(f"    流入 Top3: " + "  ".join(f"{x['industry']}({x['net']:.2f}亿)" for x in top3_in), flush=True)
+        print(f"    流出 Top3: " + "  ".join(f"{x['industry']}({x['net']:.2f}亿)" for x in bottom3_out), flush=True)
+    print("=" * 50, flush=True)
 
 if __name__ == "__main__":
     main()
