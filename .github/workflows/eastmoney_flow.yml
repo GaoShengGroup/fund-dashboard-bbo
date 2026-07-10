@@ -36,16 +36,12 @@ jobs:
           playwright install --with-deps chromium
 
       - name: Fetch data
-        run: python fetch_eastmoney_flow.py -o output/industry_fund_flow.js
-
-      - name: Install Wrangler
-        if: ${{ !inputs.dry_run }}
-        run: npm install -g wrangler
+        run: python fetch_eastmoney_flow.py -o industry_fund_flow.js
 
       - name: Deploy to Cloudflare Pages
         if: ${{ !inputs.dry_run }}
         run: |
-          npx wrangler pages deploy output/ \
+          npx wrangler pages deploy . \
             --project-name=fund-dashboard \
             --branch=main
         env:
