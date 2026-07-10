@@ -2,7 +2,6 @@ name: 东方财富行业资金流向抓取
 
 on:
   schedule:
-    # 每个交易日 16:30 CST (UTC+8) 自动执行
     - cron: "30 8 * * 1-5"
   workflow_dispatch:
     inputs:
@@ -21,6 +20,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -34,10 +38,16 @@ jobs:
       - name: Fetch data
         run: python fetch_eastmoney_flow.py -o output/industry_fund_flow.js
 
+      - name: Install Wrangler
+        if: ${{ !inputs.dry_run }}
+        run: npm install -g wrangler
+
       - name: Deploy to Cloudflare Pages
         if: ${{ !inputs.dry_run }}
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: pages deploy output/ --project-name=fund-dashboard-bbo --branch=main
+        run: |
+          npx wrangler pages deploy output/ \
+            --project-name=fund-dashboard-bbo \
+            --branch=main
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
