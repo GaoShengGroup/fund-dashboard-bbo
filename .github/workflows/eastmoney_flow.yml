@@ -1,0 +1,43 @@
+name: 东方财富行业资金流向抓取
+
+on:
+  schedule:
+    # 每个交易日 16:30 CST (UTC+8) 自动执行
+    - cron: "30 8 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "仅测试，不部署"
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  fetch-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Playwright
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+
+      - name: Fetch data
+        run: python fetch_eastmoney_flow.py -o output/industry_fund_flow.js
+
+      - name: Deploy to Cloudflare Pages
+        if: ${{ !inputs.dry_run }}
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy output/ --project-name=fund-dashboard-bbo --branch=main
