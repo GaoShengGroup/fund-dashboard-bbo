@@ -46,7 +46,7 @@ jobs:
         if: ${{ !inputs.dry_run }}
         run: |
           npx wrangler pages deploy output/ \
-            --project-name=fund-dashboard-bbo \
+            --project-name=fund-dashboard \
             --branch=main
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
